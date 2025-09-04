@@ -1,0 +1,71 @@
+//@version=6
+strategy("ICT Killzone Breakout Strategy", overlay=true,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1)
+
+// ===========================================================================
+// INPUTS
+// ===========================================================================
+session      = input.session("0930-1600", "Trading Session", group="Trading")
+rangeSession = input.session("0930-1030", "Initial Range Session", group="Killzone")
+riskPerc     = input.float(1.0,  "Stop Loss %",    minval=0.1, step=0.1, group="Risk Management")
+rewardRR     = input.float(2.0,  "Take Profit RR", minval=0.5, step=0.5, group="Risk Management")
+emaLen       = input.int(50, "Trend EMA Length", minval=1, group="Trend Filter")
+
+// ===========================================================================
+// CALCULATIONS
+// ===========================================================================
+inSession = not na(time(timeframe.period, session))
+inRange   = not na(time(timeframe.period, rangeSession))
+newDay    = ta.change(time("D")) != 0
+
+// Trend filter
+trendEMA = ta.ema(close, emaLen)
+bullTrend = close > trendEMA
+bearTrend = close < trendEMA
+
+// Initial range tracking
+var float rangeHigh = na
+var float rangeLow  = na
+
+if newDay
+    rangeHigh := na
+    rangeLow  := na
+
+if inRange
+    rangeHigh := math.max(nz(rangeHigh, low), high)
+    rangeLow  := math.min(nz(rangeLow, high), low)
+
+// Breakout conditions
+breakUp   = not na(rangeHigh) and close > rangeHigh and inSession and bullTrend
+breakDown = not na(rangeLow)  and close < rangeLow  and inSession and bearTrend
+
+// ===========================================================================
+// STRATEGY EXECUTION
+// ===========================================================================
+if breakUp
+    entryPrice = close
+    strategy.entry("Long", strategy.long)
+    stopPrice  = entryPrice * (1 - riskPerc/100)
+    takeProfit = entryPrice + (entryPrice - stopPrice) * rewardRR
+    strategy.exit("Long Exit", from_entry="Long", stop=stopPrice, limit=takeProfit)
+
+if breakDown
+    entryPrice = close
+    strategy.entry("Short", strategy.short)
+    stopPrice  = entryPrice * (1 + riskPerc/100)
+    takeProfit = entryPrice - (stopPrice - entryPrice) * rewardRR
+    strategy.exit("Short Exit", from_entry="Short", stop=stopPrice, limit=takeProfit)
+
+// ===========================================================================
+// PLOTS
+// ===========================================================================
+plot(rangeHigh, "Initial Range High", color=color.red)
+plot(rangeLow,  "Initial Range Low",  color=color.green)
+
+plot(trendEMA, "Trend EMA", color=color.orange)
+
+bgcolor(inRange ? color.new(color.yellow, 85) : na)
+bgcolor(inSession and not inRange ? color.new(color.blue, 90) : na)

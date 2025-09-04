@@ -1,0 +1,72 @@
+//@version=6
+strategy("ICT SMC Day Trading Strategy", overlay=true,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+session     = input.session("0930-1600", "Trading Session", group="Trading")
+riskPerc    = input.float(1.0,  "Stop Loss %",    minval=0.1, step=0.1, group="Risk Management")
+rewardRR    = input.float(2.0,  "Take Profit RR", minval=0.5, step=0.5, group="Risk Management")
+emaFastLen  = input.int(9,  "Fast EMA Length", minval=1, group="Trend Filter")
+emaSlowLen  = input.int(20, "Slow EMA Length", minval=1, group="Trend Filter")
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+inSession = not na(time(timeframe.period, session))
+
+// Previous day's high and low
+prevHigh = request.security(syminfo.tickerid, "D", high[1])
+prevLow  = request.security(syminfo.tickerid, "D", low[1])
+
+// Liquidity sweeps
+sweepHigh = high > prevHigh and close < prevHigh
+sweepLow  = low  < prevLow  and close > prevLow
+
+// Trend filter using EMAs
+fastEMA = ta.ema(close, emaFastLen)
+slowEMA = ta.ema(close, emaSlowLen)
+bullish = fastEMA > slowEMA
+bearish = fastEMA < slowEMA
+
+// Fair Value Gap detection (3-bar)
+fvgUp   = low[1] > high[2]
+fvgDown = high[1] < low[2]
+
+// Entry conditions
+longCondition  = inSession and sweepLow  and bullish and fvgUp
+shortCondition = inSession and sweepHigh and bearish and fvgDown
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+if longCondition
+    entryPrice = close
+    strategy.entry("Long", strategy.long)
+    stopPrice  = entryPrice * (1 - riskPerc/100)
+    takeProfit = entryPrice + (entryPrice - stopPrice) * rewardRR
+    strategy.exit("Long Exit", from_entry="Long", stop=stopPrice, limit=takeProfit)
+
+if shortCondition
+    entryPrice = close
+    strategy.entry("Short", strategy.short)
+    stopPrice  = entryPrice * (1 + riskPerc/100)
+    takeProfit = entryPrice - (stopPrice - entryPrice) * rewardRR
+    strategy.exit("Short Exit", from_entry="Short", stop=stopPrice, limit=takeProfit)
+
+// ============================================================================
+// PLOTS
+// ============================================================================
+plot(prevHigh, "Prev Day High", color=color.red)
+plot(prevLow,  "Prev Day Low",  color=color.green)
+
+plotshape(sweepHigh, "Sweep High", shape.triangledown, location.abovebar,
+          color=color.red, size=size.tiny)
+plotshape(sweepLow,  "Sweep Low",  shape.triangleup,   location.belowbar,
+          color=color.green, size=size.tiny)
+
+bgcolor(inSession ? color.new(color.blue, 85) : na)

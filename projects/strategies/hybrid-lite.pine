@@ -1,0 +1,450 @@
+//@version=6
+strategy("Hybrid ++ Lite", overlay=true, initial_capital=50000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     calc_on_every_tick=true)
+
+// ===================== Inputs =====================
+// Session / daily limits
+groupSes   = "Session / Limits"
+sessionNY  = input.string("1000-1600:1234567", "Trading Session (NY time)", group=groupSes)
+maxTradesPerDay = input.int(10, "Max trades per day", minval=1, group=groupSes)
+cooldownBars    = input.int(0,  "Cooldown bars between entries", minval=0, group=groupSes)
+
+// Daily halts
+groupHalt  = "Daily Halt Policy"
+haltAfterWins   = input.int(2, "Halt after X winners (0=off)", minval=0, group=groupHalt)
+haltAfterLosses = input.int(1, "Halt after X losses (0=off)", minval=0, group=groupHalt)
+
+// Product & risk (MNQ style)
+groupRisk  = "Stops / Contracts"
+pointSize  = input.float(1.0, "Chart point size (index pts)", step=0.1, group=groupRisk)
+slPoints   = input.int(20,  "Stop (points) — fixed, anchored", minval=1, group=groupRisk)
+contractQty= input.int(10,  "Contracts (total)", minval=1, group=groupRisk)
+
+// Take Profit
+groupTP = "Take Profit"
+tp1Pts  = input.int(50,  "TP points", minval=1, group=groupTP)
+
+// Continuation confluence
+groupConf = "Continuation Confluence"
+useFVG  = input.bool(true,  "Use 3‑bar wick FVG", group=groupConf)
+useEQ   = input.bool(true,  "Use Equal High/Low", group=groupConf)
+useOB   = input.bool(true,  "Use simple OB zone", group=groupConf)
+minConfluence = input.int(1, "Min confluences required (0–3)", minval=0, maxval=3, group=groupConf)
+
+// Reversal engine
+groupRev = "Reversal Engine (BOS / 79% / iFVG)"
+swLenBOS = input.int(2, "Swing length (fractals) for BOS", minval=1, maxval=10, group=groupRev)
+fibTolTk = input.float(3.0, "Fib 79% proximity (ticks)", minval=0.1, step=0.1, group=groupRev)
+
+// MTF confirmations — mix & match
+groupMTF = "MTF Confirmations"
+use1m  = input.bool(true,  "Use 1m",  group=groupMTF)
+use5m  = input.bool(true,  "Use 5m",  group=groupMTF)
+use15m = input.bool(true,  "Use 15m", group=groupMTF)
+use30m = input.bool(false, "Use 30m", group=groupMTF)
+use1h  = input.bool(true,  "Use 1h",  group=groupMTF)
+use4h  = input.bool(true,  "Use 4h",  group=groupMTF)
+use1d  = input.bool(false, "Use 1D",  group=groupMTF)
+requireAllSelected = input.bool(false, "Require ALL selected TFs to agree", group=groupMTF)
+minAgree           = input.int(2, "…or at least N of selected agree", minval=1, maxval=7, group=groupMTF)
+confirmOnClose     = input.bool(false, "Wait for bar close to confirm signals", group=groupMTF)
+
+// HTF key‑level bias & liquidity
+groupHTF = "HTF Key‑Level Bias & Liquidity"
+useHTFBias        = input.bool(true, "Use H1/H4 pivot‑based bias", group=groupHTF)
+pivotLen          = input.int(3, "Pivot length (H1/H4)", minval=1, maxval=10, group=groupHTF)
+rememberAsiaLondon= input.bool(true, "Use previous Asia & London H/L", group=groupHTF)
+requireNearKeyLvl = input.bool(false, "Require proximity to relevant key level", group=groupHTF)
+nearTicks         = input.float(8.0, "Proximity (ticks)", minval=0.0, step=0.25, group=groupHTF)
+useLiquiditySweep = input.bool(true, "Require a liquidity sweep vs key level", group=groupHTF)
+
+// ===================== Session/daily state =====================
+tickSz = syminfo.mintick
+fibTol = fibTolTk * tickSz
+inSession = not na(time(timeframe.period, sessionNY, "America/New_York"))
+
+var int tradesToday = 0
+var int winsToday   = 0
+var int lossesToday = 0
+var int curDay      = dayofmonth(time)
+if dayofmonth(time) != curDay
+    curDay      := dayofmonth(time)
+    tradesToday := 0
+    winsToday   := 0
+    lossesToday := 0
+
+var int lastTradeBar = na
+cooldownOK = na(lastTradeBar) or (bar_index - lastTradeBar >= cooldownBars)
+haltActive = (haltAfterWins > 0 and winsToday >= haltAfterWins) or (haltAfterLosses > 0 and lossesToday >= haltAfterLosses)
+
+// ===================== Continuation confluence (FVG, EQ, OB) =====================
+fvgUp = useFVG and (low > high[2])
+fvgDn = useFVG and (high < low[2])
+
+eqTol = 2.0 * tickSz
+eqHigh = useEQ and math.abs(high - high[1]) <= eqTol
+eqLow  = useEQ and math.abs(low  - low[1])  <= eqTol
+
+var float bullOB_hi = na
+var float bullOB_lo = na
+var float bearOB_hi = na
+var float bearOB_lo = na
+if useOB
+    if close > open and close[1] < open[1]
+        bullOB_hi := high[1]
+        bullOB_lo := low[1]
+    if close < open and close[1] > open[1]
+        bearOB_hi := high[1]
+        bearOB_lo := low[1]
+
+inBullOB = useOB and not na(bullOB_hi) and high >= bullOB_lo and low <= bullOB_hi
+inBearOB = useOB and not na(bearOB_lo) and high >= bearOB_lo and low <= bearOB_hi
+
+confBull = (fvgUp ? 1 : 0) + (eqLow ? 1 : 0)  + (inBullOB ? 1 : 0)
+confBear = (fvgDn ? 1 : 0) + (eqHigh ? 1 : 0) + (inBearOB ? 1 : 0)
+okBull   = confBull >= minConfluence
+okBear   = confBear >= minConfluence
+
+// ===================== Reversal engine (BOS / 79% / iFVG) =====================
+revUpSignal(_h,_l,_c,_sw) =>
+    var float lastHi = na
+    var float lastLo = na
+    hiLeft  = ta.highest(_h[1], _sw)
+    hiRight = ta.highest(_h, _sw)[1]
+    loLeft  = ta.lowest(_l[1], _sw)
+    loRight = ta.lowest(_l, _sw)[1]
+    isHi = hiLeft == _h[1] and hiRight == _h[1]
+    isLo = loLeft == _l[1] and loRight == _l[1]
+    if isHi
+        lastHi := _h[1]
+    if isLo
+        lastLo := _l[1]
+    bosUp = not na(lastHi) and _c > lastHi
+    hh = ta.highest(_h, 20)
+    ll = ta.lowest(_l, 20)
+    var float legHi = na
+    var float legLo = na
+    if bosUp
+        legHi := _c
+        legLo := na(lastLo) ? ll : lastLo
+    fib79 = not na(legHi) and not na(legLo) ? (legLo + 0.79 * (legHi - legLo)) : na
+    near79 = not na(fib79) and math.abs(_c - fib79) <= fibTol
+    bodyL  = math.min(_c, _c)
+    bodyH2 = math.max(_c[2], _c[2])
+    iFVGup = bodyL > bodyH2
+    bosUp or near79 or iFVGup
+
+revDnSignal(_h,_l,_c,_sw) =>
+    var float lastHi = na
+    var float lastLo = na
+    hiLeft  = ta.highest(_h[1], _sw)
+    hiRight = ta.highest(_h, _sw)[1]
+    loLeft  = ta.lowest(_l[1], _sw)
+    loRight = ta.lowest(_l, _sw)[1]
+    isHi = hiLeft == _h[1] and hiRight == _h[1]
+    isLo = loLeft == _l[1] and loRight == _l[1]
+    if isHi
+        lastHi := _h[1]
+    if isLo
+        lastLo := _l[1]
+    bosDn = not na(lastLo) and _c < lastLo
+    hh = ta.highest(_h, 20)
+    ll = ta.lowest(_l, 20)
+    var float legHi = na
+    var float legLo = na
+    if bosDn
+        legLo := _c
+        legHi := na(lastHi) ? hh : lastHi
+    fib79 = not na(legHi) and not na(legLo) ? (legHi - 0.79 * (legHi - legLo)) : na
+    near79 = not na(fib79) and math.abs(_c - fib79) <= fibTol
+    bodyH  = math.max(_c, _c)
+    bodyL2 = math.min(_c[2], _c[2])
+    iFVGdn = bodyH < bodyL2
+    bosDn or near79 or iFVGdn
+
+// ===================== MTF reversals (1m..1D) =====================
+rev1mUp  = revUpSignal(high, low, close, swLenBOS)
+rev1mDn  = revDnSignal(high, low, close, swLenBOS)
+rev5mUp  = request.security(syminfo.tickerid, "5",   revUpSignal(high, low, close, swLenBOS))
+rev5mDn  = request.security(syminfo.tickerid, "5",   revDnSignal(high, low, close, swLenBOS))
+rev15Up  = request.security(syminfo.tickerid, "15",  revUpSignal(high, low, close, swLenBOS))
+rev15Dn  = request.security(syminfo.tickerid, "15",  revDnSignal(high, low, close, swLenBOS))
+rev30Up  = request.security(syminfo.tickerid, "30",  revUpSignal(high, low, close, swLenBOS))
+rev30Dn  = request.security(syminfo.tickerid, "30",  revDnSignal(high, low, close, swLenBOS))
+rev60Up  = request.security(syminfo.tickerid, "60",  revUpSignal(high, low, close, swLenBOS))
+rev60Dn  = request.security(syminfo.tickerid, "60",  revDnSignal(high, low, close, swLenBOS))
+rev240Up = request.security(syminfo.tickerid, "240", revUpSignal(high, low, close, swLenBOS))
+rev240Dn = request.security(syminfo.tickerid, "240", revDnSignal(high, low, close, swLenBOS))
+rev1dUp  = request.security(syminfo.tickerid, "D",   revUpSignal(high, low, close, swLenBOS))
+rev1dDn  = request.security(syminfo.tickerid, "D",   revDnSignal(high, low, close, swLenBOS))
+
+// ===================== MTF votes (selected only) =====================
+f_vote(_use, _up, _dn) =>
+    up = (_use and _up) ? 1 : 0
+    dn = (_use and _dn) ? 1 : 0
+    sel = _use ? 1 : 0
+    [up, dn, sel]
+
+upVotes  = 0
+dnVotes  = 0
+selCount = 0
+
+[u1, d1, s1] = f_vote(use1m,  rev1mUp,  rev1mDn)
+upVotes  += u1
+dnVotes  += d1
+selCount += s1
+
+[u5, d5, s5] = f_vote(use5m,  rev5mUp,  rev5mDn)
+upVotes  += u5
+dnVotes  += d5
+selCount += s5
+
+[u15, d15, s15] = f_vote(use15m, rev15Up,  rev15Dn)
+upVotes  += u15
+dnVotes  += d15
+selCount += s15
+
+[u30, d30, s30] = f_vote(use30m, rev30Up,  rev30Dn)
+upVotes  += u30
+dnVotes  += d30
+selCount += s30
+
+[u60, d60, s60] = f_vote(use1h,  rev60Up,  rev60Dn)
+upVotes  += u60
+dnVotes  += d60
+selCount += s60
+
+[u240, d240, s240] = f_vote(use4h,  rev240Up, rev240Dn)
+upVotes  += u240
+dnVotes  += d240
+selCount += s240
+
+[uD, dD, sD] = f_vote(use1d,  rev1dUp,  rev1dDn)
+upVotes  += uD
+dnVotes  += dD
+selCount += sD
+
+// ===================== Agreement check (define BEFORE entries) =====================
+agreeUpAll = (not use1m or rev1mUp) and (not use5m or rev5mUp) and (not use15m or rev15Up) and (not use30m or rev30Up) and (not use1h or rev60Up) and (not use4h or rev240Up) and (not use1d or rev1dUp)
+agreeDnAll = (not use1m or rev1mDn) and (not use5m or rev5mDn) and (not use15m or rev15Dn) and (not use30m or rev30Dn) and (not use1h or rev60Dn) and (not use4h or rev240Dn) and (not use1d or rev1dDn)
+agreeUpMin = upVotes >= math.min(minAgree, math.max(selCount, 1))
+agreeDnMin = dnVotes >= math.min(minAgree, math.max(selCount, 1))
+agreeUp    = requireAllSelected ? agreeUpAll : agreeUpMin
+agreeDown  = requireAllSelected ? agreeDnAll : agreeDnMin
+
+// ===================== H1/H4 pivots (key‑level bias) =====================
+getLastPivots(_tf, _pl) =>
+    ph = request.security(syminfo.tickerid, _tf, ta.pivothigh(high, _pl, _pl))
+    pl = request.security(syminfo.tickerid, _tf, ta.pivotlow( low,  _pl, _pl))
+    lastPH = ta.valuewhen(not na(ph), ph, 0)
+    lastPL = ta.valuewhen(not na(pl), pl, 0)
+    [lastPH, lastPL]
+
+[h1PH, h1PL] = getLastPivots("60",  pivotLen)
+[h4PH, h4PL] = getLastPivots("240", pivotLen)
+
+float nearestRes = na
+float nearestSup = na
+if not na(h1PH) and h1PH >= close
+    nearestRes := na(nearestRes) ? h1PH : math.min(nearestRes, h1PH)
+if not na(h4PH) and h4PH >= close
+    nearestRes := na(nearestRes) ? h4PH : math.min(nearestRes, h4PH)
+if not na(h1PL) and h1PL <= close
+    nearestSup := na(nearestSup) ? h1PL : math.max(nearestSup, h1PL)
+if not na(h4PL) and h4PL <= close
+    nearestSup := na(nearestSup) ? h4PL : math.max(nearestSup, h4PL)
+
+float distSup = na
+float distRes = na
+distSup := na(nearestSup) ? na : (close - nearestSup)
+distRes := na(nearestRes) ? na : (nearestRes - close)
+
+bool biasLong  = true
+bool biasShort = true
+if useHTFBias
+    biasLong  := not na(distSup) and (na(distRes) or distSup <= distRes)
+    biasShort := not na(distRes) and (na(distSup) or distRes <  distSup)
+
+// Key-level proximity
+prox = nearTicks * tickSz
+bool nearSupport    = not na(nearestSup) and math.abs(close - nearestSup) <= prox
+bool nearResistance = not na(nearestRes) and math.abs(close - nearestRes) <= prox
+bool proximityOKLong  = not requireNearKeyLvl or nearSupport
+bool proximityOKShort = not requireNearKeyLvl or nearResistance
+
+// ===================== Asia/London previous session H/L =====================
+getSess(_sess) =>
+    not na(time(timeframe.period, _sess, "America/New_York"))
+
+asiaSess   = "1600-0200:1234567"
+londonSess = "0200-0800:1234567"
+inAsia     = getSess(asiaSess)
+inLondon   = getSess(londonSess)
+
+asiaStart  = inAsia and not inAsia[1]
+asiaEnd    = not inAsia and inAsia[1]
+londonStart= inLondon and not inLondon[1]
+londonEnd  = not inLondon and inLondon[1]
+
+var float asiaHi      = na
+var float asiaLo      = na
+var float prevAsiaHi  = na
+var float prevAsiaLo  = na
+
+var float londonHi      = na
+var float londonLo      = na
+var float prevLondonHi  = na
+var float prevLondonLo  = na
+
+if asiaStart
+    asiaHi := high
+    asiaLo := low
+if inAsia
+    asiaHi := math.max(asiaHi, high)
+    asiaLo := math.min(asiaLo, low)
+if asiaEnd
+    prevAsiaHi := asiaHi
+    prevAsiaLo := asiaLo
+
+if londonStart
+    londonHi := high
+    londonLo := low
+if inLondon
+    londonHi := math.max(londonHi, high)
+    londonLo := math.min(londonLo, low)
+if londonEnd
+    prevLondonHi := londonHi
+    prevLondonLo := londonLo
+
+// ===================== Liquidity sweep vs key levels =====================
+float refRes = na
+float refSup = na
+refRes := na(nearestRes) ? na : nearestRes
+refSup := na(nearestSup) ? na : nearestSup
+if rememberAsiaLondon
+    if not na(prevAsiaHi)
+        refRes := na(refRes) ? prevAsiaHi : math.min(refRes, prevAsiaHi)
+    if not na(prevLondonHi)
+        refRes := na(refRes) ? prevLondonHi : math.min(refRes, prevLondonHi)
+    if not na(prevAsiaLo)
+        refSup := na(refSup) ? prevAsiaLo : math.max(refSup, prevAsiaLo)
+    if not na(prevLondonLo)
+        refSup := na(refSup) ? prevLondonLo : math.max(refSup, prevLondonLo)
+
+// Sweep signal: wick takes level and close reclaims
+liqSweepBull = useLiquiditySweep and not na(refSup) and low < refSup and close > refSup
+liqSweepBear = useLiquiditySweep and not na(refRes) and high > refRes and close < refRes
+
+// ===================== Final entry conditions =====================
+rawLong  = inSession and (tradesToday < maxTradesPerDay) and cooldownOK and (not haltActive) and biasLong  and proximityOKLong  and agreeUp   and okBull
+rawShort = inSession and (tradesToday < maxTradesPerDay) and cooldownOK and (not haltActive) and biasShort and proximityOKShort and agreeDown and okBear
+longCond  = confirmOnClose ? (rawLong  and barstate.isconfirmed) : rawLong
+shortCond = confirmOnClose ? (rawShort and barstate.isconfirmed) : rawShort
+if useLiquiditySweep
+    longCond  := longCond  and liqSweepBull
+    shortCond := shortCond and liqSweepBear
+
+// ===================== Simplified trade management =====================
+var float longEntryPrice  = na
+var float shortEntryPrice = na
+var float longSL = na
+var float longTP = na
+var float shortSL = na
+var float shortTP = na
+var bool  anyTPHitLong  = false
+var bool  anyTPHitShort = false
+var bool  tradeRecorded = false
+
+// Detect new entries
+longOpened  = strategy.position_size > 0  and strategy.position_size[1] <= 0
+shortOpened = strategy.position_size < 0  and strategy.position_size[1] >= 0
+flatNow     = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if flatNow
+    if not tradeRecorded
+        if anyTPHitLong or anyTPHitShort
+            winsToday += 1
+        else
+            lossesToday += 1
+    longEntryPrice  := na
+    shortEntryPrice := na
+    longSL := na
+    longTP := na
+    shortSL := na
+    shortTP := na
+    anyTPHitLong  := false
+    anyTPHitShort := false
+    tradeRecorded := false
+
+if longCond and (tradesToday < maxTradesPerDay)
+    tradesToday += 1
+    strategy.entry("Long", strategy.long, qty=contractQty)
+    lastTradeBar := bar_index
+if shortCond and (tradesToday < maxTradesPerDay)
+    tradesToday += 1
+    strategy.entry("Short", strategy.short, qty=contractQty)
+    lastTradeBar := bar_index
+
+if longOpened
+    longEntryPrice := strategy.position_avg_price
+    longSL := longEntryPrice - slPoints * pointSize
+    longTP := longEntryPrice + tp1Pts * pointSize
+    strategy.exit("Long Exit", from_entry="Long", stop=longSL, limit=longTP)
+    anyTPHitLong  := false
+    anyTPHitShort := false
+    tradeRecorded := false
+
+if shortOpened
+    shortEntryPrice := strategy.position_avg_price
+    shortSL := shortEntryPrice + slPoints * pointSize
+    shortTP := shortEntryPrice - tp1Pts * pointSize
+    strategy.exit("Short Exit", from_entry="Short", stop=shortSL, limit=shortTP)
+    anyTPHitLong  := false
+    anyTPHitShort := false
+    tradeRecorded := false
+
+longTPHit  = strategy.position_size > 0 and high >= longTP
+longSLHit  = strategy.position_size > 0 and low  <= longSL
+shortTPHit = strategy.position_size < 0 and low  <= shortTP
+shortSLHit = strategy.position_size < 0 and high >= shortSL
+if longTPHit
+    anyTPHitLong := true
+if shortTPHit
+    anyTPHitShort := true
+
+if strategy.position_size[1] > 0 and strategy.position_size == 0 and not tradeRecorded
+    if anyTPHitLong
+        winsToday += 1
+    else
+        lossesToday += 1
+    tradeRecorded := true
+if strategy.position_size[1] < 0 and strategy.position_size == 0 and not tradeRecorded
+    if anyTPHitShort
+        winsToday += 1
+    else
+        lossesToday += 1
+    tradeRecorded := true
+
+// ===================== Hidden plots for alerts =====================
+plot(longEntryPrice,  title="EV_LONG_ENTRY",  display=display.none)
+plot(longSL,          title="EV_LONG_SL",     display=display.none)
+plot(longTP,          title="EV_LONG_TP",     display=display.none)
+plot(shortEntryPrice, title="EV_SHORT_ENTRY", display=display.none)
+plot(shortSL,         title="EV_SHORT_SL",    display=display.none)
+plot(shortTP,         title="EV_SHORT_TP",    display=display.none)
+
+// ===================== ALERTS =====================
+alertcondition(longCond,  title="EV_LONG_ENTRY",
+   message="{\"secret\":\"Ronhits\",\"event\":\"LONG_ENTRY\",\"symbol\":\"{{ticker}}\",\"time\":\"{{time}}\",\"entry\":{{plot(\"EV_LONG_ENTRY\")}},\"sl\":{{plot(\"EV_LONG_SL\")}},\"tp\":{{plot(\"EV_LONG_TP\")}}}")
+alertcondition(shortCond, title="EV_SHORT_ENTRY",
+   message="{\"secret\":\"Ronhits\",\"event\":\"SHORT_ENTRY\",\"symbol\":\"{{ticker}}\",\"time\":\"{{time}}\",\"entry\":{{plot(\"EV_SHORT_ENTRY\")}},\"sl\":{{plot(\"EV_SHORT_SL\")}},\"tp\":{{plot(\"EV_SHORT_TP\")}}}")
+
+alertcondition(longTPHit, title="EV_LONG_TP_HIT",
+   message="{\"secret\":\"Ronhits\",\"event\":\"LONG_TP_HIT\",\"symbol\":\"{{ticker}}\",\"time\":\"{{time}}\",\"price\":{{plot(\"EV_LONG_TP\")}}}")
+alertcondition(longSLHit, title="EV_LONG_SL_HIT",
+   message="{\"secret\":\"Ronhits\",\"event\":\"LONG_SL_HIT\",\"symbol\":\"{{ticker}}\",\"time\":\"{{time}}\",\"price\":{{plot(\"EV_LONG_SL\")}}}")
+alertcondition(shortTPHit, title="EV_SHORT_TP_HIT",
+   message="{\"secret\":\"Ronhits\",\"event\":\"SHORT_TP_HIT\",\"symbol\":\"{{ticker}}\",\"time\":\"{{time}}\",\"price\":{{plot(\"EV_SHORT_TP\")}}}")
+alertcondition(shortSLHit, title="EV_SHORT_SL_HIT",
+   message="{\"secret\":\"Ronhits\",\"event\":\"SHORT_SL_HIT\",\"symbol\":\"{{ticker}}\",\"time\":\"{{time}}\",\"price\":{{plot(\"EV_SHORT_SL\")}}}")
