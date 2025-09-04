@@ -355,10 +355,12 @@ var float shortTP = na
 var bool  tradeWon = false
 
 // Detect new entries
-if longCond and strategy.position_size <= 0
+if longCond and (tradesToday < maxTradesPerDay)
+    tradesToday += 1
     strategy.entry("Long", strategy.long, qty=contractQty)
     lastTradeBar := bar_index
-if shortCond and strategy.position_size >= 0
+if shortCond and (tradesToday < maxTradesPerDay)
+    tradesToday += 1
     strategy.entry("Short", strategy.short, qty=contractQty)
     lastTradeBar := bar_index
 
@@ -372,7 +374,6 @@ if longOpened
     longTP := longEntryPrice + tp1Pts * pointSize
     strategy.exit("Long Exit", from_entry="Long", stop=longSL, limit=longTP)
     tradeWon := false
-    tradesToday += 1
 
 if shortOpened
     shortEntryPrice := strategy.position_avg_price
@@ -380,7 +381,6 @@ if shortOpened
     shortTP := shortEntryPrice - tp1Pts * pointSize
     strategy.exit("Short Exit", from_entry="Short", stop=shortSL, limit=shortTP)
     tradeWon := false
-    tradesToday += 1
 
 longTPHit  = strategy.position_size > 0 and high >= longTP
 longSLHit  = strategy.position_size > 0 and low  <= longSL
